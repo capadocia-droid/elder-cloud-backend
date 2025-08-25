@@ -1,152 +1,139 @@
-// server.mjs
 import express from "express";
-import nodemailer from "nodemailer";
+import bodyParser from "body-parser";
 import fs from "fs";
-import temp from "temp";
-import { OpenAI } from "openai";
+import path from "path";
+import { fileURLToPath } from "url";
+import nodemailer from "nodemailer";
+import OpenAI from "openai";
 
-/**
- * ========= ENV VARS (set these in Render → Environment) =========
- *  PORT                (Render sets this automatically)
- *  OPENAI_API_KEY      e.g. sk-...
- *  API_SHARED_KEY      e.g. yoursecret         <-- must match the app
- *
- *  EMAIL_FROM          e.g. "Elder Recorder <no-reply@example.com>"
- *  SMTP_HOST           e.g. smtp.sendgrid.net (or your provider)
- *  SMTP_PORT           e.g. 587
- *  SMTP_SECURE         "false" or "true"
- *  SMTP_USER           smtp username (or leave undefined for unauth)
- *  SMTP_PASS           smtp password
- * ================================================================
- */
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-const {
-  PORT = 3000,
-  OPENAI_API_KEY,
-  API_SHARED_KEY,
-  EMAIL_FROM = '"Elder Recorder" <no-reply@example.com>',
-  SMTP_HOST,
-  SMTP_PORT = 587,
-  SMTP_SECURE = "false",
-  SMTP_USER,
-  SMTP_PASS
-} = process.env;
+const PORT = process.env.PORT || 3000;
+const API_SHARED_KEY = process.env.API_SHARED_KEY || "secret123";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 if (!OPENAI_API_KEY) {
-  throw new Error("Missing OPENAI_API_KEY");
+  console.error("❌ Missing OPENAI_API_KEY in environment");
+  process.exit(1);
 }
 
-const app = express();
-app.use(express.json({ limit: "50mb" }));
-
-// ---------- OPEN HEALTH CHECK (no auth) ----------
-app.get("/healthz", (_, res) => res.json({ ok: true }));
-
-// ---------- AUTH MIDDLEWARE (all other routes) ----------
-app.use((req, res, next) => {
-  if (req.path === "/healthz") return next();
-  const k = req.headers["x-shared-key"];
-  if (!API_SHARED_KEY || k === API_SHARED_KEY) return next();
-  return res.status(401).json({ ok: false, error: "Unauthorized" });
-});
-
-// ---------- EMAIL TRANSPORT ----------
-const transporter = nodemailer.createTransport({
-  host: SMTP_HOST,
-  port: Number(SMTP_PORT),
-  secure: String(SMTP_SECURE).toLowerCase() === "true",
-  auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined
-});
-
-// ---------- OPENAI ----------
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// helper: write base64 audio to temp file and return path
-async function base64ToTempFile(base64, filename = "audio.m4a") {
-  const info = temp.openSync({ prefix: "elder_", suffix: "_" + filename });
-  fs.writeFileSync(info.path, Buffer.from(base64, "base64"));
-  return info.path;
+const app = express();
+app.use(bodyParser.json({ limit: "50mb" }));
+
+// ------------------------
+// Retry wrapper for transcription
+// ------------------------
+async function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
-/**
- * POST /upload
- * Body:
- * {
- *   elderName?: string,
- *   caregiverEmail: string,
- *   ccEmail?: string,
- *   bccEmail?: string,
- *   replyDisplayName?: string,
- *   audioFileName?: string,
- *   audioB64: string   // base64 audio (m4a / aac)
- * }
- * Returns: { ok: true, transcriptText, deliveredAtISO }
- */
+async function transcribeWithRetry(filePath, { model = "whisper-1", tries = 4 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= tries; attempt++) {
+    try {
+      const file = fs.createReadStream(filePath);
+      const r = await openai.audio.transcriptions.create({ file, model });
+      return (r?.text || "").trim();
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `⚠️ Transcribe attempt ${attempt} failed:`,
+        err?.code || err?.name || err?.message
+      );
+      if (attempt < tries) await sleep(800 * attempt * attempt); // backoff
+    }
+  }
+  throw lastErr;
+}
+
+// ------------------------
+// Routes
+// ------------------------
+app.get("/", (req, res) => {
+  res.json({ ok: true, message: "Elder backend running" });
+});
+
+app.get("/healthz", (req, res) => {
+  res.json({ ok: true, status: "healthy" });
+});
+
 app.post("/upload", async (req, res) => {
   try {
-    const {
-      elderName,
-      caregiverEmail,
-      ccEmail,
-      bccEmail,
-      replyDisplayName,
-      audioFileName = "interview.m4a",
-      audioB64
-    } = req.body || {};
+    // ------------------------
+    // Auth
+    // ------------------------
+    const key = req.headers["x-api-key"];
+    if (key !== API_SHARED_KEY) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
 
+    const { audioB64, caregiverEmail, elderName } = req.body;
     if (!audioB64 || !caregiverEmail) {
       return res.status(400).json({ ok: false, error: "audioB64 and caregiverEmail required" });
     }
 
-    // 1) Save temp audio file
-    const tmpPath = await base64ToTempFile(audioB64, audioFileName);
+    // ------------------------
+    // Save temp audio file
+    // ------------------------
+    const tmpPath = path.join(__dirname, `upload_${Date.now()}.m4a`);
+    fs.writeFileSync(tmpPath, Buffer.from(audioB64, "base64"));
 
-    // 2) Transcribe with OpenAI (text-only)
-    //    model options (as of mid-2025): "gpt-4o-transcribe" or "whisper-1"
-    const file = fs.createReadStream(tmpPath);
-    const tr = await openai.audio.transcriptions.create({
-      file,
-      model: "gpt-4o-transcribe"
-    });
-    const transcriptText = (tr?.text || "").trim() || "(empty transcript)";
+    // ------------------------
+    // Transcribe
+    // ------------------------
+    let transcriptText = "(no transcript)";
+    try {
+      transcriptText =
+        (await transcribeWithRetry(tmpPath, { model: "whisper-1", tries: 4 })) ||
+        "(empty transcript)";
+    } catch (err) {
+      console.error("❌ Transcription error:", err);
+      return res.status(500).json({ ok: false, error: "Transcription failed" });
+    }
 
-    // 3) Email transcript only (no audio)
-    const header = [
-      elderName ? `Elder: ${elderName}` : null,
-      replyDisplayName ? `Recorded by: ${replyDisplayName}` : null,
-      audioFileName ? `File: ${audioFileName}` : null
-    ]
-      .filter(Boolean)
-      .join("\n");
+    // ------------------------
+    // Email the transcript
+    // ------------------------
+    try {
+      const transporter = nodemailer.createTransport({
+        service: "gmail",
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASS
+        }
+      });
 
-    const emailText = (header ? header + "\n\n" : "") + transcriptText;
+      const subject = `Elder Interview Transcript ${elderName || ""}`.trim();
+      const mail = {
+        from: process.env.SMTP_USER,
+        to: caregiverEmail,
+        subject,
+        text: transcriptText
+      };
 
-    await transporter.sendMail({
-      from: EMAIL_FROM,
-      to: caregiverEmail,
-      cc: ccEmail || undefined,
-      bcc: bccEmail || undefined,
-      subject: `Transcript – ${audioFileName}`,
-      text: emailText,
-      attachments: [
-        { filename: (audioFileName.replace(/\.[^/.]+$/, "") || "transcript") + ".txt", content: emailText }
-      ]
-    });
+      await transporter.sendMail(mail);
+      console.log("✅ Transcript sent to", caregiverEmail);
+    } catch (err) {
+      console.error("❌ Email send error:", err.message);
+      // still return transcript so app knows it worked up to here
+      return res.status(500).json({ ok: false, error: "Email send failed" });
+    }
 
-    // 4) Cleanup temp file
-    try { fs.unlinkSync(tmpPath); } catch {}
-
-    return res.json({
-      ok: true,
-      transcriptText,
-      deliveredAtISO: new Date().toISOString()
-    });
-  } catch (e) {
-    console.error("Upload error:", e);
-    return res.status(500).json({ ok: false, error: "Transcription/email failed" });
+    // ------------------------
+    // Cleanup + respond
+    // ------------------------
+    fs.unlinkSync(tmpPath);
+    res.json({ ok: true, transcript: transcriptText });
+  } catch (err) {
+    console.error("❌ Upload error:", err);
+    res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
-// ---------- START ----------
-app.listen(PORT, () => console.log(`API listening on :${PORT}`));
-
+// ------------------------
+app.listen(PORT, () => {
+  console.log(`🚀 API listening on :${PORT}`);
+});
