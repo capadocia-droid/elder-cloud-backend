@@ -1,0 +1,13 @@
+{
+  "type": "module",
+  "name": "elder-cloud-backend",
+  "version": "1.0.0",
+  "main": "server.mjs",
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "nodemailer": "^6.9.13",
+    "openai": "^4.52.0",
+    "temp": "^0.9.4"
+  }
+}
